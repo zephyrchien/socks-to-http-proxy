@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use base64::engine::general_purpose;
 use base64::Engine;
 use hyper::header::HeaderValue;
-use tokio::net::TcpListener;
+use tokio::net::TcpSocket;
 
 #[derive(Debug, Args)]
 #[group()]
@@ -86,7 +86,15 @@ async fn main() -> Result<()> {
         .transpose()?;
     let http_basic = &*Box::leak(Box::new(http_basic));
 
-    let listener = TcpListener::bind(addr).await?;
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    // try to set SO_REUSEADDR
+    let _ = socket.set_reuseaddr(true);
+    socket.bind(addr)?;
+    // this matches the behavior of [TcpListener::bind]
+    let listener = socket.listen(1024)?;
 
     #[cfg(not(target_os = "windows"))]
     {
