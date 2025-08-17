@@ -12,6 +12,7 @@ use base64::engine::general_purpose;
 use base64::Engine;
 use hyper::header::HeaderValue;
 use tokio::net::TcpSocket;
+use tokio::runtime;
 
 #[derive(Debug, Args)]
 #[group()]
@@ -62,13 +63,22 @@ struct Cli {
     detached: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("sthp=debug"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     color_eyre::install()?;
 
     let args = Cli::parse();
+
+    #[cfg(unix)]
+    {
+        if args.detached {
+            let daemonize = daemonize::Daemonize::new().umask(0);
+            if let Err(e) = daemonize.start() {
+                eprintln!("Error: {}", e);
+            }
+        }
+    }
 
     let socks_addr = args.socks_address;
     let port = args.port;
@@ -86,43 +96,37 @@ async fn main() -> Result<()> {
         .transpose()?;
     let http_basic = &*Box::leak(Box::new(http_basic));
 
-    let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
-    // try to set SO_REUSEADDR
-    let _ = socket.set_reuseaddr(true);
-    socket.bind(addr)?;
-    // this matches the behavior of [TcpListener::bind]
-    let listener = socket.listen(1024)?;
+    runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async move {
+            let socket = match addr {
+                SocketAddr::V4(_) => TcpSocket::new_v4()?,
+                SocketAddr::V6(_) => TcpSocket::new_v6()?,
+            };
+            // try to set SO_REUSEADDR
+            let _ = socket.set_reuseaddr(true);
+            socket.bind(addr)?;
+            // this matches the behavior of [TcpListener::bind]
+            let listener = socket.listen(1024)?;
+            info!("Listening on http://{}", addr);
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        if args.detached {
-            let daemonize = daemonize::Daemonize::new();
-            if let Err(e) = daemonize.start() {
-                eprintln!("Error: {}", e);
+            loop {
+                let (stream, client_addr) = listener.accept().await?;
+                tokio::task::spawn(async move {
+                    if let Err(e) = proxy_request(
+                        stream,
+                        client_addr,
+                        socks_addr,
+                        auth_details.as_ref(),
+                        allowed_domains.as_ref(),
+                        http_basic.as_ref(),
+                    )
+                    .await
+                    {
+                        error!("Error proxying request: {}", e);
+                    }
+                });
             }
-        }
-    }
-
-    info!("Listening on http://{}", addr);
-
-    loop {
-        let (stream, client_addr) = listener.accept().await?;
-        tokio::task::spawn(async move {
-            if let Err(e) = proxy_request(
-                stream,
-                client_addr,
-                socks_addr,
-                auth_details.as_ref(),
-                allowed_domains.as_ref(),
-                http_basic.as_ref(),
-            )
-            .await
-            {
-                error!("Error proxying request: {}", e);
-            }
-        });
-    }
+        })
 }
